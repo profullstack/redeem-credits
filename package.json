@@ -1,7 +1,7 @@
 {
   "name": "@profullstack/redeem-credits",
-  "version": "0.1.0",
-  "description": "Redeemable credit codes for every Profullstack site: mint a scarce code, redeem it for one-off or monthly credits, spend against the balance. Codes stored only as sha256 hashes; memory, SQLite (bun:sqlite, node:sqlite, better-sqlite3) and Postgres stores; redeem-credits CLI.",
+  "version": "0.2.0",
+  "description": "Redeemable credit codes for every Profullstack site: mint a scarce code, redeem it for one-off or monthly credits, spend against the balance. Codes stored only as sha256 hashes; memory, SQLite (bun:sqlite, node:sqlite, better-sqlite3), Postgres and Supabase (supabase-js + rpc) stores; onGrant hook to mirror grants into your own ledger; redeem-credits CLI.",
   "license": "MIT",
   "type": "module",
   "repository": {
@@ -19,7 +19,9 @@
     "allowance",
     "ledger",
     "sqlite",
-    "postgres"
+    "postgres",
+    "supabase",
+    "postgrest"
   ],
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -28,13 +30,15 @@
       "types": "./dist/index.d.ts",
       "default": "./dist/index.js"
     },
-    "./package.json": "./package.json"
+    "./package.json": "./package.json",
+    "./migrations/supabase.sql": "./migrations/supabase.sql"
   },
   "bin": {
     "redeem-credits": "./dist/cli.js"
   },
   "files": [
     "dist",
+    "migrations",
     "README.md",
     "LICENSE"
   ],
@@ -45,11 +49,17 @@
     "build": "rm -rf dist && tsc -p tsconfig.build.json && chmod +x dist/cli.js",
     "test": "node --experimental-strip-types --no-warnings --test test/*.test.ts",
     "typecheck": "tsc --noEmit",
-    "prepublishOnly": "npm run typecheck && npm test && npm run build"
+    "prepublishOnly": "npm run typecheck && npm test && npm run build",
+    "migration": "node --experimental-strip-types --no-warnings scripts/write-migration.ts",
+    "e2e:up": "scripts/postgrest-up.sh",
+    "e2e:down": "docker rm -f rc-e2e-pg rc-e2e-rest"
   },
   "devDependencies": {
     "@electric-sql/pglite": "^0.5.12",
+    "@supabase/supabase-js": "^2.118.0",
     "@types/node": "^22.20.5",
+    "@types/pg": "^8.23.1",
+    "pg": "^8.23.1",
     "typescript": "^5.9.3"
   }
 }
