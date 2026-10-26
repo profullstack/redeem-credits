@@ -246,14 +246,28 @@ export function computeBalance(entries: LedgerEntry[], now: number): number {
 // Credits
 // ---------------------------------------------------------------------------
 
+/**
+ * Called after a grant is recorded: once per successful redeem() (source
+ * `code:<codeId>`) and once per grant() (its source, default "admin"). Use it
+ * to mirror the grant into a ledger the site already has. It runs after the
+ * store committed the grant; if it throws, the error reaches the caller of
+ * redeem()/grant() but the grant stays recorded (the code is used).
+ */
+export type OnGrant = (userId: string, grant: Grant, source: string) => Promise<void> | void;
+
+export type CreditsOptions = { now?: () => number; onGrant?: OnGrant };
+
 export class Credits {
   private store: CreditStore;
   private now: () => number;
+  private onGrant: OnGrant | undefined;
 
-  constructor(store: CreditStore, opts?: { now?: () => number }) {
+  constructor(store: CreditStore, opts?: CreditsOptions) {
     if (!store) throw new TypeError("a CreditStore is required");
+    if (opts?.onGrant !== undefined && typeof opts.onGrant !== "function") throw new TypeError("onGrant must be a function");
     this.store = store;
     this.now = opts?.now ?? Date.now;
+    this.onGrant = opts?.onGrant;
   }
 
   async mint(o: MintOptions): Promise<MintedCode> {
@@ -289,6 +303,7 @@ export class Credits {
     if (normalized.replace(/-/g, "").length < BODY_LENGTH) return { ok: false, reason: "invalid" };
     const r = await this.store.redeemCode(hashCode(normalized), userId, this.now());
     if (!r.ok) return r;
+    if (this.onGrant) await this.onGrant(userId, { ...r.code.grant }, `code:${r.code.id}`);
     return { ok: true, grant: { ...r.code.grant }, codeId: r.code.id };
   }
 
@@ -315,6 +330,7 @@ export class Credits {
   async grant(userId: string, g: Grant, source?: string): Promise<void> {
     requireUser(userId);
     const grant = normalizeGrant(g);
+    const src = source ?? "admin";
     await this.store.appendLedger({
       userId,
       unit: grant.unit,
@@ -322,9 +338,10 @@ export class Credits {
       kind: "grant",
       every: grant.every,
       months: grant.months,
-      source: source ?? "admin",
+      source: src,
       at: this.now(),
     });
+    if (this.onGrant) await this.onGrant(userId, { ...grant }, src);
   }
 
   async list(): Promise<CodeInfo[]> {
@@ -777,6 +794,350 @@ export function postgresStore(pool: PgLike, opts?: { prefix?: string }): CreditS
           ? await q(`SELECT * FROM ${p}ledger WHERE user_id = $1 ORDER BY at, id`, [userId])
           : await q(`SELECT * FROM ${p}ledger WHERE user_id = $1 AND unit = $2 ORDER BY at, id`, [userId, unit]);
       return rows.map(rowToEntry);
+    },
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Supabase store (supabase-js / PostgREST, service role key)
+// ---------------------------------------------------------------------------
+
+/** The error object supabase-js / PostgREST returns. */
+export type SupabaseError = { message: string; code?: string; details?: string | null; hint?: string | null };
+
+type SupabaseResponse<T> = PromiseLike<{ data: T | null; error: SupabaseError | null }>;
+
+/** A select() chain: awaitable, plus the two modifiers this store uses. */
+export interface SupabaseSelect extends SupabaseResponse<any[]> {
+  order(column: string, options?: { ascending?: boolean }): SupabaseSelect;
+  range(from: number, to: number): SupabaseSelect;
+}
+
+/**
+ * The subset of `@supabase/supabase-js`'s SupabaseClient that supabaseStore
+ * uses: `from(table).select(...).order(...).range(...)`, `from(table).insert(row)`
+ * and `rpc(fn, args)`. A client from `createClient(url, serviceRoleKey)`
+ * satisfies it; so does any fake that maps those calls onto SQL.
+ */
+export interface SupabaseLike {
+  from(table: string): {
+    select(columns?: string): SupabaseSelect;
+    insert(values: any): SupabaseResponse<any>;
+  };
+  rpc(fn: string, args?: Record<string, unknown>): SupabaseResponse<any>;
+}
+
+/**
+ * The Supabase migration: the four tables (RLS on, no policies, so only the
+ * service role reaches them) and the SECURITY DEFINER functions that do the
+ * atomic parts (redeem, compare-and-swap spend, account read, history,
+ * revoke). Execute on the functions is revoked from PUBLIC, anon and
+ * authenticated. `migrations/supabase.sql` in the package is this with the
+ * default prefix. Idempotent: safe to apply twice.
+ */
+export function supabaseMigrationSql(prefix = "credit_"): string {
+  const p = tablePrefix(prefix);
+  const t = (name: string) => `public.${p}${name}`;
+  const fn = (name: string) => `public.${p}${name}`;
+  const tables = ["codes", "redemptions", "ledger", "accounts"].map(t);
+  const functions = [
+    `${fn("redeem")}(text, text, bigint)`,
+    `${fn("append_if_version")}(text, text, double precision, text, text, integer, text, bigint, integer)`,
+    `${fn("account")}(text, text)`,
+    `${fn("history")}(text, text)`,
+    `${fn("revoke")}(text, bigint)`,
+  ];
+  return `-- @profullstack/redeem-credits: Supabase schema (table prefix "${p}")
+-- Apply as a migration (supabase/migrations/<timestamp>_redeem_credits.sql).
+-- Tables have RLS enabled and NO policies: only the service role (which
+-- bypasses RLS) can read or write them. The functions are SECURITY DEFINER
+-- with a pinned search_path, and only service_role may execute them.
+
+CREATE TABLE IF NOT EXISTS ${t("codes")} (
+  id TEXT PRIMARY KEY,
+  hash TEXT NOT NULL UNIQUE,
+  label TEXT NOT NULL,
+  unit TEXT NOT NULL,
+  amount DOUBLE PRECISION NOT NULL,
+  recur TEXT,
+  months INTEGER,
+  max_redemptions INTEGER NOT NULL,
+  redemptions INTEGER NOT NULL DEFAULT 0,
+  expires_at BIGINT,
+  created_at BIGINT NOT NULL,
+  revoked_at BIGINT,
+  created_by TEXT
+);
+
+CREATE TABLE IF NOT EXISTS ${t("redemptions")} (
+  code_id TEXT NOT NULL,
+  user_id TEXT NOT NULL,
+  at BIGINT NOT NULL,
+  PRIMARY KEY (code_id, user_id)
+);
+
+CREATE TABLE IF NOT EXISTS ${t("ledger")} (
+  id BIGSERIAL PRIMARY KEY,
+  user_id TEXT NOT NULL,
+  unit TEXT NOT NULL,
+  amount DOUBLE PRECISION NOT NULL,
+  kind TEXT NOT NULL,
+  recur TEXT,
+  months INTEGER,
+  source TEXT NOT NULL,
+  at BIGINT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS ${p}ledger_user_unit ON ${t("ledger")} (user_id, unit, at);
+
+CREATE TABLE IF NOT EXISTS ${t("accounts")} (
+  user_id TEXT NOT NULL,
+  unit TEXT NOT NULL,
+  version INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (user_id, unit)
+);
+
+${tables.map((x) => `ALTER TABLE ${x} ENABLE ROW LEVEL SECURITY;`).join("\n")}
+
+-- Redeem a code (by sha256 hash) for a user, atomically. The row lock on the
+-- code serializes concurrent redeemers, so max_redemptions and one redemption
+-- per (code, user) hold. Returns {"ok":true,"code":{...}} or {"ok":false,"reason":"..."}.
+CREATE OR REPLACE FUNCTION ${fn("redeem")}(p_hash text, p_user_id text, p_at bigint)
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = ''
+AS $fn$
+DECLARE
+  c ${t("codes")}%ROWTYPE;
+BEGIN
+  SELECT * INTO c FROM ${t("codes")} WHERE hash = p_hash FOR UPDATE;
+  IF NOT FOUND THEN
+    RETURN jsonb_build_object('ok', false, 'reason', 'invalid');
+  END IF;
+  IF c.revoked_at IS NOT NULL THEN
+    RETURN jsonb_build_object('ok', false, 'reason', 'revoked');
+  END IF;
+  IF c.expires_at IS NOT NULL AND p_at >= c.expires_at THEN
+    RETURN jsonb_build_object('ok', false, 'reason', 'expired');
+  END IF;
+  IF EXISTS (SELECT 1 FROM ${t("redemptions")} r WHERE r.code_id = c.id AND r.user_id = p_user_id) THEN
+    RETURN jsonb_build_object('ok', false, 'reason', 'already_redeemed');
+  END IF;
+  IF c.redemptions >= c.max_redemptions THEN
+    RETURN jsonb_build_object('ok', false, 'reason', 'used_up');
+  END IF;
+  UPDATE ${t("codes")} SET redemptions = redemptions + 1 WHERE id = c.id;
+  INSERT INTO ${t("redemptions")} (code_id, user_id, at) VALUES (c.id, p_user_id, p_at);
+  INSERT INTO ${t("ledger")} (user_id, unit, amount, kind, recur, months, source, at)
+    VALUES (p_user_id, c.unit, c.amount, 'grant', c.recur, c.months, 'code:' || c.id, p_at);
+  c.redemptions := c.redemptions + 1;
+  RETURN jsonb_build_object('ok', true, 'code', to_jsonb(c));
+END;
+$fn$;
+
+-- Compare-and-swap append: bump the (user, unit) version and append the entry
+-- only if the version still equals p_version. Spends go through this, so two
+-- concurrent spends can never both pass the balance check.
+CREATE OR REPLACE FUNCTION ${fn("append_if_version")}(
+  p_user_id text, p_unit text, p_amount double precision, p_kind text, p_recur text,
+  p_months integer, p_source text, p_at bigint, p_version integer
+)
+RETURNS boolean
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = ''
+AS $fn$
+BEGIN
+  INSERT INTO ${t("accounts")} (user_id, unit, version) VALUES (p_user_id, p_unit, 0) ON CONFLICT DO NOTHING;
+  UPDATE ${t("accounts")} SET version = version + 1
+    WHERE user_id = p_user_id AND unit = p_unit AND version = p_version;
+  IF NOT FOUND THEN
+    RETURN false;
+  END IF;
+  INSERT INTO ${t("ledger")} (user_id, unit, amount, kind, recur, months, source, at)
+    VALUES (p_user_id, p_unit, p_amount, p_kind, p_recur, p_months, p_source, p_at);
+  RETURN true;
+END;
+$fn$;
+
+-- One user's version and ledger for one unit, from a single snapshot, as one
+-- JSON value (so PostgREST's max-rows never truncates it).
+CREATE OR REPLACE FUNCTION ${fn("account")}(p_user_id text, p_unit text)
+RETURNS jsonb
+LANGUAGE sql
+STABLE
+SECURITY DEFINER
+SET search_path = ''
+AS $fn$
+  SELECT jsonb_build_object(
+    'version', COALESCE((SELECT a.version FROM ${t("accounts")} a WHERE a.user_id = p_user_id AND a.unit = p_unit), 0),
+    'entries', COALESCE((SELECT jsonb_agg(to_jsonb(l) ORDER BY l.at, l.id) FROM ${t("ledger")} l
+                         WHERE l.user_id = p_user_id AND l.unit = p_unit), '[]'::jsonb)
+  );
+$fn$;
+
+-- A user's ledger, optionally for one unit (p_unit null = all units).
+CREATE OR REPLACE FUNCTION ${fn("history")}(p_user_id text, p_unit text DEFAULT NULL)
+RETURNS jsonb
+LANGUAGE sql
+STABLE
+SECURITY DEFINER
+SET search_path = ''
+AS $fn$
+  SELECT COALESCE(jsonb_agg(to_jsonb(l) ORDER BY l.at, l.id), '[]'::jsonb)
+  FROM ${t("ledger")} l
+  WHERE l.user_id = p_user_id AND (p_unit IS NULL OR l.unit = p_unit);
+$fn$;
+
+-- Revoke a code by id (idempotent: keeps the first revoked_at). False if no such id.
+CREATE OR REPLACE FUNCTION ${fn("revoke")}(p_id text, p_at bigint)
+RETURNS boolean
+LANGUAGE sql
+SECURITY DEFINER
+SET search_path = ''
+AS $fn$
+  WITH u AS (
+    UPDATE ${t("codes")} SET revoked_at = COALESCE(revoked_at, p_at) WHERE id = p_id RETURNING 1
+  )
+  SELECT EXISTS (SELECT 1 FROM u);
+$fn$;
+
+${functions.map((f) => `REVOKE ALL ON FUNCTION ${f} FROM PUBLIC;`).join("\n")}
+
+-- Supabase roles: anon and authenticated get nothing (Supabase's default
+-- privileges would otherwise grant them table and function access);
+-- service_role gets what supabaseStore needs. Skipped on plain Postgres.
+DO $grants$
+DECLARE
+  r text;
+BEGIN
+  FOREACH r IN ARRAY ARRAY['anon', 'authenticated'] LOOP
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = r) THEN
+${tables.map((x) => `      EXECUTE format('REVOKE ALL ON TABLE ${x} FROM %I', r);`).join("\n")}
+      EXECUTE format('REVOKE ALL ON SEQUENCE ${t("ledger")}_id_seq FROM %I', r);
+${functions.map((f) => `      EXECUTE format('REVOKE ALL ON FUNCTION ${f} FROM %I', r);`).join("\n")}
+    END IF;
+  END LOOP;
+  IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'service_role') THEN
+${tables.map((x) => `    GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE ${x} TO service_role;`).join("\n")}
+    GRANT USAGE, SELECT ON SEQUENCE ${t("ledger")}_id_seq TO service_role;
+${functions.map((f) => `    GRANT EXECUTE ON FUNCTION ${f} TO service_role;`).join("\n")}
+  END IF;
+END
+$grants$;
+`;
+}
+
+function supabaseFail(what: string, error: SupabaseError): Error {
+  const err = new Error(`supabaseStore ${what}: ${error.message}${error.hint ? ` (${error.hint})` : ""}`);
+  (err as Error & { code?: string; cause?: unknown }).code = error.code;
+  (err as Error & { cause?: unknown }).cause = error;
+  return err;
+}
+
+/**
+ * CreditStore over supabase-js / PostgREST. Needs the tables and functions
+ * from `supabaseMigrationSql(prefix)` (or `migrations/supabase.sql`) applied
+ * first: it never creates schema at runtime. Use a service-role client,
+ * server side only. The atomic parts (redeem, spend's compare-and-swap,
+ * revoke) run inside Postgres functions called with rpc().
+ */
+export function supabaseStore(client: SupabaseLike, opts?: { prefix?: string }): CreditStore {
+  const p = tablePrefix(opts?.prefix);
+  if (!client || typeof client.from !== "function" || typeof client.rpc !== "function") {
+    throw new TypeError("supabaseStore needs a supabase-js client (from() and rpc())");
+  }
+  const rpc = async (name: string, args: Record<string, unknown>): Promise<unknown> => {
+    const { data, error } = await client.rpc(p + name, args);
+    if (error) throw supabaseFail(`rpc ${p}${name}`, error);
+    return data;
+  };
+  const rows = (v: unknown): Record<string, unknown>[] => (Array.isArray(v) ? v : []) as Record<string, unknown>[];
+
+  return {
+    async insertCode(c) {
+      const { error } = await client.from(`${p}codes`).insert({
+        id: c.id,
+        hash: c.hash,
+        label: c.label,
+        unit: c.grant.unit,
+        amount: c.grant.amount,
+        recur: c.grant.every ?? null,
+        months: c.grant.months ?? null,
+        max_redemptions: c.maxRedemptions,
+        redemptions: c.redemptions,
+        expires_at: c.expiresAt ?? null,
+        created_at: c.createdAt,
+        revoked_at: c.revokedAt ?? null,
+        created_by: c.createdBy ?? null,
+      });
+      if (error) throw supabaseFail(`insert ${p}codes`, error);
+    },
+    async redeemCode(hash, userId, at) {
+      const r = (await rpc("redeem", { p_hash: hash, p_user_id: userId, p_at: at })) as {
+        ok?: boolean;
+        reason?: RedeemFailure;
+        code?: Record<string, unknown>;
+      } | null;
+      if (r?.ok && r.code && sameHash(String(r.code.hash), hash)) return { ok: true, code: rowToCode(r.code) };
+      return { ok: false, reason: r?.ok === false && r.reason ? r.reason : "invalid" };
+    },
+    async listCodes() {
+      // Page until an empty page: PostgREST caps rows per request (max-rows).
+      const out: CodeRecord[] = [];
+      const page = 1000;
+      for (let from = 0; ; ) {
+        const { data, error } = await client
+          .from(`${p}codes`)
+          .select("*")
+          .order("created_at", { ascending: false })
+          .order("id", { ascending: true })
+          .range(from, from + page - 1);
+        if (error) throw supabaseFail(`select ${p}codes`, error);
+        const got = rows(data);
+        if (got.length === 0) break;
+        out.push(...got.map(rowToCode));
+        from += got.length;
+      }
+      return out;
+    },
+    async revokeCode(id, at) {
+      return (await rpc("revoke", { p_id: id, p_at: at })) === true;
+    },
+    async appendLedger(e) {
+      const { error } = await client.from(`${p}ledger`).insert({
+        user_id: e.userId,
+        unit: e.unit,
+        amount: e.amount,
+        kind: e.kind,
+        recur: e.every ?? null,
+        months: e.months ?? null,
+        source: e.source,
+        at: e.at,
+      });
+      if (error) throw supabaseFail(`insert ${p}ledger`, error);
+    },
+    async account(userId, unit) {
+      const r = (await rpc("account", { p_user_id: userId, p_unit: unit })) as { version?: unknown; entries?: unknown } | null;
+      return { version: num(r?.version ?? 0), entries: rows(r?.entries).map(rowToEntry) };
+    },
+    async appendIfVersion(e, version) {
+      const ok = await rpc("append_if_version", {
+        p_user_id: e.userId,
+        p_unit: e.unit,
+        p_amount: e.amount,
+        p_kind: e.kind,
+        p_recur: e.every ?? null,
+        p_months: e.months ?? null,
+        p_source: e.source,
+        p_at: e.at,
+        p_version: version,
+      });
+      return ok === true;
+    },
+    async history(userId, unit) {
+      return rows(await rpc("history", { p_user_id: userId, p_unit: unit ?? null })).map(rowToEntry);
     },
   };
 }

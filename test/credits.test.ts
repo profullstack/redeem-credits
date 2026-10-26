@@ -5,7 +5,9 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { PGlite } from "@electric-sql/pglite";
-import { Credits, memoryStore, sqliteStore, postgresStore, normalizeCode, computeBalance, monthIndex, type CreditStore } from "../src/index.ts";
+import { Credits, memoryStore, sqliteStore, postgresStore, supabaseStore, supabaseMigrationSql, normalizeCode, computeBalance, monthIndex, type CreditStore } from "../src/index.ts";
+import { fakeSupabase } from "./fake-supabase.ts";
+import { realPg, uniquePrefix } from "./pg.ts";
 
 const T0 = Date.UTC(2026, 9, 26, 12, 0, 0); // 2026-10-26 12:00 UTC
 
@@ -39,7 +41,27 @@ const stores: [string, Maker][] = [
       return postgresStore(pg as unknown as { query(sql: string, params?: unknown[]): Promise<{ rows: any[] }> });
     },
   ],
+  [
+    "supabase (rpc functions on PGlite via fake supabase-js)",
+    async () => {
+      const pg = new PGlite();
+      pglites.push(pg);
+      await pg.exec(supabaseMigrationSql());
+      return supabaseStore(fakeSupabase((sql, params) => pg.query(sql, params)));
+    },
+  ],
 ];
+const pool = realPg();
+if (pool) {
+  stores.push([
+    "supabase (rpc functions on real Postgres via fake supabase-js)",
+    async () => {
+      const prefix = uniquePrefix();
+      await pool.query(supabaseMigrationSql(prefix));
+      return supabaseStore(fakeSupabase((sql, params) => pool.query(sql, params)), { prefix });
+    },
+  ]);
+}
 
 for (const [name, make] of stores) {
   describe(`Credits on ${name}`, () => {

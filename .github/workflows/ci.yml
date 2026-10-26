@@ -1,0 +1,27 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node: [22, 24]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - name: migrations/supabase.sql is up to date
+        run: npm run migration && git diff --exit-code migrations/
+      - name: Start Postgres + PostgREST (Supabase-like roles)
+        run: scripts/postgrest-up.sh | sed 's/^export //' | tr ' ' '\n' >> "$GITHUB_ENV"
+      - run: npm test
+      - run: npm run build
