@@ -1,0 +1,55 @@
+{
+  "name": "@profullstack/redeem-credits",
+  "version": "0.1.0",
+  "description": "Redeemable credit codes for every Profullstack site: mint a scarce code, redeem it for one-off or monthly credits, spend against the balance. Codes stored only as sha256 hashes; memory, SQLite (bun:sqlite, node:sqlite, better-sqlite3) and Postgres stores; redeem-credits CLI.",
+  "license": "MIT",
+  "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/profullstack/redeem-credits.git"
+  },
+  "homepage": "https://github.com/profullstack/redeem-credits#readme",
+  "keywords": [
+    "credits",
+    "redeem",
+    "invite codes",
+    "gift codes",
+    "promo codes",
+    "vouchers",
+    "allowance",
+    "ledger",
+    "sqlite",
+    "postgres"
+  ],
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "bin": {
+    "redeem-credits": "./dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "rm -rf dist && tsc -p tsconfig.build.json && chmod +x dist/cli.js",
+    "test": "node --experimental-strip-types --no-warnings --test test/*.test.ts",
+    "typecheck": "tsc --noEmit",
+    "prepublishOnly": "npm run typecheck && npm test && npm run build"
+  },
+  "devDependencies": {
+    "@electric-sql/pglite": "^0.5.12",
+    "@types/node": "^22.20.5",
+    "typescript": "^5.9.3"
+  }
+}
